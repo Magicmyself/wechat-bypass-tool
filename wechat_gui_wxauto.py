@@ -39,6 +39,16 @@ class WeChatNT:
         if not self.control.Exists(1):
             raise Exception("无法绑定微信窗口句柄，可能权限不足，请尝试以管理员身份运行。")
             
+        # 绑定并缓存会话列表 ListControl，加速非当前窗口的 UIA 检索，防止超时
+        self.session_list = self.control.ListControl(AutomationId='session_list')
+        if not self.session_list.Exists(1):
+            self.session_list = self.control
+            
+        # 绑定并缓存聊天窗口标题栏，加速当前窗口检测，消除检索延迟
+        self.chat_title_bar = self.control.GroupControl(ClassName='mmui::ChatTitleBarMasterView')
+        if not self.chat_title_bar.Exists(1):
+            self.chat_title_bar = None
+            
         # 缓存 Control 实例以避免频繁遍历 UI 树造成的性能开销
         self.session_controls = {}
         self.input_field = None
@@ -63,25 +73,37 @@ class WeChatNT:
 
     def ChatWith(self, who):
         # 1. 尝试直接点击左侧会话列表中的项目
-        session = self.control.ListItemControl(AutomationId=f'session_item_{who}')
-        if session.Exists(0.5):
+        session = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
+        if session.Exists(0.1):
             session.Click()
-            time.sleep(0.5)
+            # 动态等待输入框加载完成
+            input_field = self.control.EditControl(AutomationId='chat_input_field')
+            start = time.time()
+            while time.time() - start < 0.2:
+                if input_field.Exists(0.01):
+                    break
+                time.sleep(0.01)
             return True
             
         # 2. 如果左侧没有，使用搜索框搜索
         search_box = self.control.EditControl(ClassName='mmui::XValidatorTextEdit', Name='搜索')
-        if search_box.Exists(0.5):
+        if search_box.Exists(0.2):
             search_box.Click()
             search_box.SendKeys('{Ctrl}a{Delete}')
             
-            pyperclip.copy(who)
+            set_clipboard_text(who)
             search_box.SendKeys('{Ctrl}v')
-            time.sleep(0.8) # 等待搜索结果列表渲染
+            time.sleep(0.3) # 缩短等待搜索结果列表渲染时间
             
             # 按回车键直接进入第一个搜索结果
             search_box.SendKeys('{Enter}')
-            time.sleep(0.5)
+            # 动态等待输入框加载
+            input_field = self.control.EditControl(AutomationId='chat_input_field')
+            start = time.time()
+            while time.time() - start < 0.3:
+                if input_field.Exists(0.01):
+                    break
+                time.sleep(0.01)
             return True
         return False
 
@@ -122,9 +144,23 @@ class WeChatNT:
         win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
         win32api.keybd_event(win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0)
 
+    def GetCurrentActiveChatName(self):
+        # 优先使用缓存的标题栏进行极速检测，如果失效或未加载则执行延迟绑定
+        if not self.chat_title_bar:
+            self.chat_title_bar = self.control.GroupControl(ClassName='mmui::ChatTitleBarMasterView')
+            if not self.chat_title_bar.Exists(0.1):
+                self.chat_title_bar = None
+                return None
+        
+        label = self.chat_title_bar.TextControl(ClassName='mmui::XTextView')
+        if label.Exists(0.05):
+            return label.Name
+        return None
+
+
     def GetLastMessage(self, who):
-        # 每次都执行 50ms 极短超时搜索，既能迅速捕获会话，又绝不因失效 COM 缓存引发 1~2 秒系统锁死
-        session = self.control.ListItemControl(AutomationId=f'session_item_{who}')
+        # 每次都执行 50ms 极短超时搜索，基于 session_list 限定查找以防超时
+        session = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
         if not session.Exists(0.05):
             return None, None
             
@@ -160,16 +196,16 @@ class WeChatBotWxAutoGUI:
         self.is_connected = False
         self.is_monitoring = False
         
-        self.target_room = ""    # 目标群聊名称
-        self.target_sender = ""  # 目标发言人昵称
-        self.reply_text = ""     # 回复内容
+        self.rules = []           # 规则库配置列表，格式如：{"room":x, "sender":y, "mode":z, "keywords":[], "reply":w}
+        self.target_rooms = []    # 提取的唯一群聊列表
         self.safe_mode = tk.BooleanVar(value=True)
+        self.current_active_room = None
         
         # 消息同步队列与后台线程
         self.gui_queue = queue.Queue()
         self.listener_thread = None
         self.is_listening = False
-        self.last_msg_sig = ""
+        self.last_msg_sigs = {}   # 各群最新消息签名映射表
         
         # 界面主题与布局
         self.setup_styles()
@@ -219,32 +255,75 @@ class WeChatBotWxAutoGUI:
         main_pane.pack(fill="both", expand=True, padx=15, pady=5)
         
         # 左侧面板：设置参数与自动回复
-        left_frame = ttk.LabelFrame(main_pane, text=" 秒回配置中心 ", padding=10)
+        left_frame = ttk.LabelFrame(main_pane, text=" 秒回配置中心 & 规则库 ", padding=10)
         main_pane.add(left_frame, weight=1)
+        left_frame.columnconfigure(0, weight=1)
+        left_frame.columnconfigure(1, weight=1)
         
         # 目标群聊名称 (支持中文昵称)
-        ttk.Label(left_frame, text="目标群聊名称 (必须完全一致):").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Label(left_frame, text="目标群聊名称 (单群):").grid(row=0, column=0, sticky="w", pady=2)
         self.ent_room = ttk.Entry(left_frame, width=30)
-        self.ent_room.grid(row=1, column=0, columnspan=2, sticky="we", pady=5)
+        self.ent_room.grid(row=1, column=0, columnspan=2, sticky="we", pady=2)
         
         # 目标人昵称 (支持中文昵称)
-        ttk.Label(left_frame, text="目标发言人昵称 (必须完全一致):").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Label(left_frame, text="目标发言人昵称 (单人，*表所有人):").grid(row=2, column=0, sticky="w", pady=2)
         self.ent_sender = ttk.Entry(left_frame, width=30)
-        self.ent_sender.grid(row=3, column=0, columnspan=2, sticky="we", pady=5)
+        self.ent_sender.grid(row=3, column=0, columnspan=2, sticky="we", pady=2)
+        
+        # 匹配规则选择 与 触发关键词 并列
+        ttk.Label(left_frame, text="匹配规则模式:").grid(row=4, column=0, sticky="w", pady=2)
+        self.lbl_keywords = ttk.Label(left_frame, text="触发关键词 (英文逗号分隔):")
+        self.lbl_keywords.grid(row=4, column=1, sticky="w", pady=2)
+        
+        self.cmb_mode = ttk.Combobox(left_frame, values=["无条件秒回 (任意内容)", "包含任意关键词", "精确匹配关键词"], state="readonly")
+        self.cmb_mode.current(0)
+        self.cmb_mode.grid(row=5, column=0, sticky="we", padx=(0, 5), pady=2)
+        self.cmb_mode.bind("<<ComboboxSelected>>", self.on_match_mode_change)
+        
+        self.ent_keywords = ttk.Entry(left_frame, width=15)
+        self.ent_keywords.grid(row=5, column=1, sticky="we", padx=(5, 0), pady=2)
+        self.ent_keywords.config(state="disabled")
         
         # 回复内容
-        ttk.Label(left_frame, text="秒回固定内容:").grid(row=4, column=0, sticky="w", pady=5)
-        self.txt_reply = scrolledtext.ScrolledText(left_frame, height=4, width=30, font=("微软雅黑", 9))
-        self.txt_reply.grid(row=5, column=0, columnspan=2, sticky="we", pady=5)
+        ttk.Label(left_frame, text="专属秒回回复内容:").grid(row=6, column=0, sticky="w", pady=2)
+        self.txt_reply = scrolledtext.ScrolledText(left_frame, height=2, font=("微软雅黑", 9))
+        self.txt_reply.grid(row=7, column=0, columnspan=2, sticky="we", pady=2)
         self.txt_reply.insert("1.0", "收到！这是自动秒回测试。")
+        
+        # 规则控制操作按钮
+        self.btn_add_rule = ttk.Button(left_frame, text=" 添加 / 更新规则 ", style="Success.TButton", command=self.add_or_update_rule)
+        self.btn_add_rule.grid(row=8, column=0, sticky="we", padx=(0, 5), pady=5)
+        
+        self.btn_del_rule = ttk.Button(left_frame, text=" 删除选中规则 ", style="Danger.TButton", command=self.delete_rule)
+        self.btn_del_rule.grid(row=8, column=1, sticky="we", padx=(5, 0), pady=5)
+        
+        # 规则展示表格
+        ttk.Label(left_frame, text="当前秒回规则库 (双击规则行可编辑):").grid(row=9, column=0, sticky="w", pady=(5, 2))
+        
+        rule_cols = ("room", "sender", "mode", "keywords", "reply")
+        self.rules_tree = ttk.Treeview(left_frame, columns=rule_cols, show="headings", height=5)
+        self.rules_tree.heading("room", text="群聊名称")
+        self.rules_tree.heading("sender", text="发言人")
+        self.rules_tree.heading("mode", text="匹配模式")
+        self.rules_tree.heading("keywords", text="关键词")
+        self.rules_tree.heading("reply", text="回复内容")
+        
+        self.rules_tree.column("room", width=70, anchor="w")
+        self.rules_tree.column("sender", width=60, anchor="w")
+        self.rules_tree.column("mode", width=80, anchor="center")
+        self.rules_tree.column("keywords", width=80, anchor="w")
+        self.rules_tree.column("reply", width=120, anchor="w")
+        
+        self.rules_tree.grid(row=10, column=0, columnspan=2, sticky="we", pady=2)
+        self.rules_tree.bind("<Double-1>", self.load_rule_to_form)
         
         # 安全模式选项
         chk_safe = ttk.Checkbutton(left_frame, text="安全模拟（加入100~300ms随机延迟以防封号）", variable=self.safe_mode)
-        chk_safe.grid(row=6, column=0, columnspan=2, sticky="w", pady=10)
+        chk_safe.grid(row=11, column=0, columnspan=2, sticky="w", pady=5)
         
         # 启动/停止按钮
         self.btn_action = ttk.Button(left_frame, text=" 第二步：启动秒回监控 ", style="Success.TButton", state="disabled", command=self.toggle_monitoring)
-        self.btn_action.grid(row=7, column=0, columnspan=2, sticky="we", pady=10)
+        self.btn_action.grid(row=12, column=0, columnspan=2, sticky="we", pady=5)
 
         # 右侧面板：实时群消息监听与日志 (用于抓取昵称)
         right_frame = ttk.LabelFrame(main_pane, text=" 锁定群聊消息面板（双击下方任意行可自动填入配置） ", padding=10)
@@ -287,6 +366,119 @@ class WeChatBotWxAutoGUI:
         self.log_area.insert("end", f"[{t_str}] {text}\n")
         self.log_area.see("end")
 
+    def on_match_mode_change(self, event=None):
+        mode = self.cmb_mode.get()
+        if mode == "无条件秒回 (任意内容)":
+            self.ent_keywords.delete(0, "end")
+            self.ent_keywords.config(state="disabled")
+        else:
+            self.ent_keywords.config(state="normal")
+
+    def refresh_rules_tree(self):
+        # 清空表格
+        for item in self.rules_tree.get_children():
+            self.rules_tree.delete(item)
+        # 重新插入所有规则
+        for r in self.rules:
+            kws = ", ".join(r['keywords']) if r['keywords'] else "-"
+            self.rules_tree.insert("", "end", values=(r['room'], r['sender'], r['mode'], kws, r['reply']))
+
+    def add_or_update_rule(self):
+        room = self.ent_room.get().strip()
+        sender = self.ent_sender.get().strip()
+        reply = self.txt_reply.get("1.0", "end-1c").strip()
+        mode = self.cmb_mode.get()
+        keywords_raw = self.ent_keywords.get().strip()
+        
+        if not room or not sender or not reply:
+            messagebox.showwarning("参数缺失", "请先填入完整的群聊名称、发言者昵称和回复内容！")
+            return
+            
+        if mode != "无条件秒回 (任意内容)" and not keywords_raw:
+            messagebox.showwarning("参数缺失", "在此匹配模式下，请先输入触发关键词！")
+            return
+            
+        keywords = [k.strip() for k in keywords_raw.replace("，", ",").split(",") if k.strip()]
+        
+        # 检查是否已存在该群聊+发言人的规则 (如果存在则更新，否则新增)
+        existing_idx = -1
+        for idx, r in enumerate(self.rules):
+            if r['room'] == room and r['sender'] == sender:
+                existing_idx = idx
+                break
+                
+        rule_data = {
+            "room": room,
+            "sender": sender,
+            "mode": mode,
+            "keywords": keywords,
+            "reply": reply
+        }
+        
+        if existing_idx >= 0:
+            self.rules[existing_idx] = rule_data
+            self.log(f"已更新规则 -> 群聊: {room} | 发言人: {sender}")
+        else:
+            self.rules.append(rule_data)
+            self.log(f"已添加规则 -> 群聊: {room} | 发言人: {sender}")
+            
+        self.refresh_rules_tree()
+        
+        # 清空表单，方便输入下一条规则
+        self.ent_room.delete(0, "end")
+        self.ent_sender.delete(0, "end")
+        self.ent_keywords.delete(0, "end")
+        self.txt_reply.delete("1.0", "end")
+        self.cmb_mode.current(0)
+        self.on_match_mode_change()
+
+    def delete_rule(self):
+        selected = self.rules_tree.selection()
+        if not selected:
+            messagebox.showwarning("未选中", "请在规则列表中选中一行进行删除！")
+            return
+            
+        item = self.rules_tree.item(selected[0])
+        values = item['values']
+        room = values[0]
+        sender = values[1]
+        
+        # 从 rules 中删除
+        self.rules = [r for r in self.rules if not (r['room'] == room and r['sender'] == sender)]
+        self.log(f"已删除规则 -> 群聊: {room} | 发言人: {sender}")
+        self.refresh_rules_tree()
+
+    def load_rule_to_form(self, event=None):
+        selected = self.rules_tree.selection()
+        if not selected:
+            return
+            
+        values = self.rules_tree.item(selected[0], "values")
+        if values:
+            room = values[0]
+            sender = values[1]
+            mode = values[2]
+            kws = values[3]
+            reply = values[4]
+            
+            self.ent_room.delete(0, "end")
+            self.ent_room.insert(0, room)
+            
+            self.ent_sender.delete(0, "end")
+            self.ent_sender.insert(0, sender)
+            
+            self.cmb_mode.set(mode)
+            self.on_match_mode_change()
+            
+            self.ent_keywords.delete(0, "end")
+            if kws != "-":
+                self.ent_keywords.insert(0, kws)
+                
+            self.txt_reply.delete("1.0", "end")
+            self.txt_reply.insert("1.0", reply)
+            
+            self.log(f"已加载规则至编辑器 -> 群聊: {room} | 发言人: {sender}")
+
     def connect_wechat(self):
         self.log("正在尝试绑定微信桌面客户端...")
         try:
@@ -318,28 +510,55 @@ class WeChatBotWxAutoGUI:
                 time.sleep(1)
                 continue
             
-            if not self.is_monitoring or not self.target_room:
+            if not self.is_monitoring or not self.rules:
                 time.sleep(0.5)
                 continue
                 
-            try:
-                # 获取最后一条消息的发送者和内容
-                sender, content = self.wx.GetLastMessage(self.target_room)
-                if sender and content:
-                    msg_sig = f"{sender}:{content}"
-                    if msg_sig != self.last_msg_sig:
-                        self.last_msg_sig = msg_sig
-                        # 推送到主线程队列（仅供展示使用）
-                        self.gui_queue.put((self.target_room, sender, content, 'friend'))
-                        
-                        # 极致优化：直接在此处（后台线程）同步触发发送逻辑，完全跳过 GUI 线程排队延迟（可省下约 20~50ms）
-                        if self.is_monitoring:
-                            if sender == self.target_sender:
-                                threading.Thread(target=self.do_fast_reply, args=(self.target_room, content), daemon=True).start()
-            except Exception as e:
-                pass
+            for room in self.target_rooms:
+                if not self.is_monitoring:
+                    break
+                    
+                try:
+                    # 获取该群最后一条消息的发送者和内容
+                    sender, content = self.wx.GetLastMessage(room)
+                    if sender and content:
+                        msg_sig = f"{sender}:{content}"
+                        old_sig = self.last_msg_sigs.get(room, "")
+                        if msg_sig != old_sig:
+                            self.last_msg_sigs[room] = msg_sig
+                            # 推送到主线程队列（仅供展示使用）
+                            self.gui_queue.put((room, sender, content, 'friend'))
+                            
+                            # 遍历规则库寻找匹配规则
+                            for rule in self.rules:
+                                if rule['room'] == room:
+                                    # 1. 校验发言人是否符合规则
+                                    if rule['sender'] == '*' or rule['sender'] == sender:
+                                        # 2. 校验内容匹配模式
+                                        content_matched = False
+                                        mode = rule['mode']
+                                        keywords = rule['keywords']
+                                        
+                                        if mode == "无条件秒回 (任意内容)":
+                                            content_matched = True
+                                        elif mode == "包含任意关键词":
+                                            if any(kw in content for kw in keywords):
+                                                content_matched = True
+                                        elif mode == "精确匹配关键词":
+                                            if any(kw == content for kw in keywords):
+                                                content_matched = True
+                                                
+                                        if content_matched:
+                                            # 极致优化：直接在此处（后台线程）同步触发发送专属回复内容
+                                            threading.Thread(
+                                                target=self.do_fast_reply, 
+                                                args=(room, content, rule['reply']), 
+                                                daemon=True
+                                            ).start()
+                except Exception as e:
+                    pass
                 
-            time.sleep(0.01) # 10ms 轮询一次，缩短侦测间隔延迟（从 100ms 减少到 10ms）
+            time.sleep(0.01) # 扫描完所有群后等待 10ms
 
     def process_queue(self):
         # 保证 GUI 线程安全地读取后台传来的消息
@@ -357,23 +576,29 @@ class WeChatBotWxAutoGUI:
             if len(self.tree.get_children()) > 100:
                 self.tree.delete(self.tree.get_children()[-1])
 
-    def do_fast_reply(self, chat, incoming_content):
+    def do_fast_reply(self, chat, incoming_content, reply_text):
         try:
             start_time = time.time()
+            
+            # 动态检测当前窗口，若不同则快速切换
+            current_active = self.wx.GetCurrentActiveChatName()
+            if current_active != chat:
+                self.wx.ChatWith(chat)
+                
             if self.safe_mode.get():
                 time.sleep(0.1 + random.random() * 0.2)
                 
-            # 发送消息至当前窗口
-            self.wx.SendMsg(msg=self.reply_text)
+            # 发送该规则对应的专属回复
+            self.wx.SendMsg(msg=reply_text)
             
             end_time = time.time()
             elapsed = (end_time - start_time) * 1000
-            self.root.after(0, lambda: self.log(f"【成功秒回】目标发了: '{incoming_content}' | 回复用时: {elapsed:.2f}毫秒"))
+            self.root.after(0, lambda: self.log(f"【成功秒回】群聊: '{chat}' | 发言: '{incoming_content}' | 关联总耗时: {elapsed:.2f}毫秒"))
         except Exception as e:
             self.root.after(0, lambda: self.log(f"秒回发送失败，错误: {e}"))
 
     def on_tree_double_click(self, event):
-        # 双击表格中的行，自动填入配置
+        # 双击表格中的行，自动载入表单
         selected_item = self.tree.selection()
         if not selected_item:
             return
@@ -389,55 +614,65 @@ class WeChatBotWxAutoGUI:
             self.ent_sender.delete(0, "end")
             self.ent_sender.insert(0, sender_name)
             
-            self.log(f"已自动填入群聊: {room_name} | 发言人: {sender_name}")
+            self.log(f"已将该行信息载入配置区 -> 群聊: {room_name} | 发言人: {sender_name}")
 
     def toggle_monitoring(self):
         if not self.is_monitoring:
-            room = self.ent_room.get().strip()
-            sender = self.ent_sender.get().strip()
-            reply = self.txt_reply.get("1.0", "end-1c").strip()
-            
-            if not room or not sender or not reply:
-                messagebox.showwarning("参数缺失", "请先填入完整的群聊名称、发言者昵称和回复内容！\n(您可以通过双击右侧消息板中的行来自动填入姓名)")
+            if not self.rules:
+                messagebox.showwarning("规则库为空", "请先在规则库中添加至少一条秒回规则！")
                 return
-            
-            self.target_room = room
-            self.target_sender = sender
-            self.reply_text = reply
-            
-            # 切换并激活目标群聊
-            try:
-                self.log(f"正在打开群聊【{self.target_room}】...")
-                self.wx.ChatWith(self.target_room)
                 
-                # 初始化第一条消息的签名，防止把之前的历史消息也当做新消息秒回
-                sender_init, content_init = self.wx.GetLastMessage(self.target_room)
-                if sender_init and content_init:
-                    self.last_msg_sig = f"{sender_init}:{content_init}"
-                else:
-                    self.last_msg_sig = ""
-                    
-                self.log(f"已锁定并激活群聊【{self.target_room}】。开始监控消息...")
+            # 提取所有唯一的监控群聊
+            self.target_rooms = list(set(r['room'] for r in self.rules))
+            self.last_msg_sigs = {}
+            self.current_active_room = None
+            
+            first_room = self.target_rooms[0]
+            try:
+                self.log(f"正在初始化窗口，激活首个群聊【{first_room}】...")
+                self.wx.ChatWith(first_room)
+                self.current_active_room = first_room
+                
+                # 初始化所有目标群的消息签名
+                for r in self.target_rooms:
+                    sender_init, content_init = self.wx.GetLastMessage(r)
+                    if sender_init and content_init:
+                        self.last_msg_sigs[r] = f"{sender_init}:{content_init}"
+                    else:
+                        self.last_msg_sigs[r] = ""
+                        
+                self.log(f"已锁定并激活所有群聊，共 {len(self.target_rooms)} 个。开始监控消息...")
             except Exception as e:
-                self.log(f"打开群聊失败: {e}")
+                self.log(f"激活群聊失败: {e}")
                 messagebox.showerror("打开错误", f"无法切换到该群聊！\n请确保微信中该群聊在聊天列表中可见，或者名称完全正确。\n\n错误: {e}")
                 return
-            
+                
             self.is_monitoring = True
             self.btn_action.config(text=" 停止秒回监控 ", style="Danger.TButton")
             
+            # 禁用所有编辑器控件与表单
             self.ent_room.config(state="disabled")
             self.ent_sender.config(state="disabled")
+            self.cmb_mode.config(state="disabled")
+            self.ent_keywords.config(state="disabled")
             self.txt_reply.config(state="disabled")
+            self.btn_add_rule.config(state="disabled")
+            self.btn_del_rule.config(state="disabled")
             
-            self.log(f"▶ 秒回监控已开启！锁定群聊: {self.target_room} | 目标人物: {self.target_sender}")
+            self.log(f"▶ 秒回监控已开启！当前共运行 {len(self.rules)} 条秒回规则。")
         else:
             self.is_monitoring = False
             self.btn_action.config(text=" 第二步：启动秒回监控 ", style="Success.TButton")
             
+            # 恢复编辑器控件与表单
             self.ent_room.config(state="normal")
             self.ent_sender.config(state="normal")
+            self.cmb_mode.config(state="normal")
+            if self.cmb_mode.get() != "无条件秒回 (任意内容)":
+                self.ent_keywords.config(state="normal")
             self.txt_reply.config(state="normal")
+            self.btn_add_rule.config(state="normal")
+            self.btn_del_rule.config(state="normal")
             
             self.log("⏸ 秒回监控已暂停。")
 
