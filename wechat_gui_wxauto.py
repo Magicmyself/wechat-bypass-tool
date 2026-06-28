@@ -29,29 +29,53 @@ class WeChatNT:
         self.HWND = self.get_wechat_hwnd()
         if not self.HWND:
             raise Exception("未找到微信主窗口。请确保微信PC端已启动并登录。")
-            
+
         # 如果微信窗口最小化了，自动将其还原
         if win32gui.IsIconic(self.HWND):
             win32gui.ShowWindow(self.HWND, win32con.SW_RESTORE)
             time.sleep(1)
-            
+
         self.control = uia.ControlFromHandle(self.HWND)
         if not self.control.Exists(1):
             raise Exception("无法绑定微信窗口句柄，可能权限不足，请尝试以管理员身份运行。")
-            
-        # 绑定并缓存会话列表 ListControl，加速非当前窗口的 UIA 检索，防止超时
-        self.session_list = self.control.ListControl(AutomationId='session_list')
-        if not self.session_list.Exists(1):
-            self.session_list = self.control
-            
-        # 绑定并缓存聊天窗口标题栏，加速当前窗口检测，消除检索延迟
-        self.chat_title_bar = self.control.GroupControl(ClassName='mmui::ChatTitleBarMasterView')
-        if not self.chat_title_bar.Exists(1):
-            self.chat_title_bar = None
-            
-        # 缓存 Control 实例以避免频繁遍历 UI 树造成的性能开销
-        self.session_controls = {}
-        self.input_field = None
+
+        # 多候选回退：绑定并缓存会话列表 ListControl
+        # 新版Qt微信用 AutomationId='session_list'，旧版用 ClassName='SessionList'
+        self.session_list = self._find_control_multi(
+            [("list", {"AutomationId": "session_list"}),
+             ("list", {"ClassName": "SessionList"}),
+             ("list", {})],
+            timeout=1.5
+        ) or self.control
+
+        # 多候选回退：绑定并缓存聊天标题栏
+        self.chat_title_bar = self._find_control_multi(
+            [("group", {"ClassName": "mmui::ChatTitleBarMasterView"}),
+             ("group", {"ClassName": "TitleBarView"}),
+             ("group", {"AutomationId": "chat_title_bar"})],
+            timeout=1.0
+        )
+
+        # 发送端当前群聊状态缓存（无需每次查询 UIA 标题栏）
+        self._current_chat = None
+
+    def _find_control_multi(self, candidates, timeout=0.5):
+        """多候选回退查询：按优先级依次尝试，找到即返回，全部失败返回 None"""
+        for ctrl_type, kwargs in candidates:
+            try:
+                if ctrl_type == "list":
+                    c = self.control.ListControl(**kwargs)
+                elif ctrl_type == "group":
+                    c = self.control.GroupControl(**kwargs)
+                elif ctrl_type == "edit":
+                    c = self.control.EditControl(**kwargs)
+                else:
+                    c = self.control.Control(**kwargs)
+                if c.Exists(timeout):
+                    return c
+            except Exception:
+                continue
+        return None
 
     def get_wechat_hwnd(self):
         wechat_hwnd = None
@@ -73,111 +97,212 @@ class WeChatNT:
         win32gui.EnumWindows(callback, None)
         return wechat_hwnd
 
+    def _find_input_field(self, timeout=0.15):
+        """多候选回退：查找聊天输入框"""
+        candidates = [
+            {"AutomationId": "chat_input_field"},
+            {"ClassName": "mmui::XValidatorTextEdit", "Name": ""},
+            {"ClassName": "RichEdit20W"},
+        ]
+        for kwargs in candidates:
+            try:
+                f = self.control.EditControl(**{k: v for k, v in kwargs.items() if v != ""})
+                if f.Exists(timeout):
+                    return f
+            except Exception:
+                continue
+        # 最后兜底：查找任意可见 EditControl
+        try:
+            f = self.control.EditControl()
+            if f.Exists(0.05):
+                return f
+        except Exception:
+            pass
+        return None
+
+    def _find_search_box(self, timeout=0.2):
+        """多候选回退：查找微信搜索框"""
+        candidates = [
+            {"ClassName": "mmui::XValidatorTextEdit", "Name": "搜索"},
+            {"ClassName": "mmui::XValidatorTextEdit", "Name": "Search"},
+            {"AutomationId": "search_input"},
+            {"Name": "搜索"},
+        ]
+        for kwargs in candidates:
+            try:
+                f = self.control.EditControl(**{k: v for k, v in kwargs.items()})
+                if f.Exists(timeout):
+                    return f
+            except Exception:
+                continue
+        return None
+
     def ChatWith(self, who):
-        # 1. 尝试直接点击左侧会话列表中的项目
-        session = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
-        if session.Exists(0.1):
-            session.Click()
-            # 动态等待输入框加载完成
-            input_field = self.control.EditControl(AutomationId='chat_input_field')
-            start = time.time()
-            while time.time() - start < 0.2:
-                if input_field.Exists(0.01):
-                    break
-                time.sleep(0.01)
-            return True
-            
-        # 2. 如果左侧没有，使用搜索框搜索
-        search_box = self.control.EditControl(ClassName='mmui::XValidatorTextEdit', Name='搜索')
-        if search_box.Exists(0.2):
-            search_box.Click()
-            search_box.SendKeys('{Ctrl}a{Delete}')
-            
-            set_clipboard_text(who)
-            search_box.SendKeys('{Ctrl}v')
-            time.sleep(0.3) # 缩短等待搜索结果列表渲染时间
-            
-            # 按回车键直接进入第一个搜索结果
-            search_box.SendKeys('{Enter}')
-            # 动态等待输入框加载
-            input_field = self.control.EditControl(AutomationId='chat_input_field')
-            start = time.time()
-            while time.time() - start < 0.3:
-                if input_field.Exists(0.01):
-                    break
-                time.sleep(0.01)
-            return True
+        """切换到指定群/联系人聊天窗口，优先会话列表直接点击，回退到搜索框"""
+        # 确保微信窗口在前台，防止 UIA 操作在后台失效
+        try:
+            win32gui.SetForegroundWindow(self.HWND)
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+        # 路径1：从 session_list 直接按 AutomationId 点击（新版Qt微信）
+        try:
+            session = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
+            if session.Exists(0.08):
+                session.Click()
+                self._current_chat = who
+                self._wait_input_ready()
+                return True
+        except Exception:
+            pass
+
+        # 路径2：从 session_list 按 Name 匹配（旧版微信或 AutomationId 不存在时）
+        try:
+            items = self.session_list.GetChildren()
+            for item in items:
+                try:
+                    if who in item.Name:
+                        item.Click()
+                        self._current_chat = who
+                        self._wait_input_ready()
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 路径3：使用搜索框（多候选查找搜索框）
+        search_box = self._find_search_box(timeout=0.25)
+        if search_box:
+            try:
+                search_box.Click()
+                time.sleep(0.03)
+                search_box.SendKeys('{Ctrl}a{Delete}')
+                set_clipboard_text(who)
+                search_box.SendKeys('{Ctrl}v')
+                # 动态轮询等待搜索结果出现，最长等 500ms（替换原来固定 300ms sleep）
+                deadline = time.time() + 0.5
+                while time.time() < deadline:
+                    result = self.session_list.ListItemControl()
+                    if result.Exists(0.05):
+                        break
+                    time.sleep(0.03)
+                search_box.SendKeys('{Enter}')
+                self._current_chat = who
+                self._wait_input_ready()
+                return True
+            except Exception:
+                pass
+
         return False
 
+    def _wait_input_ready(self, timeout=0.3):
+        """等待聊天输入框出现，多候选，最长等 timeout 秒"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            f = self._find_input_field(timeout=0.05)
+            if f:
+                return f
+            time.sleep(0.02)
+        return None
+
     def SendMsg(self, msg):
-        # 每次都执行 100ms 快速定位，避免使用长期失效的 COM 缓存，防止 Windows UIA 超时导致锁死 1~2 秒
-        input_field = self.control.EditControl(AutomationId='chat_input_field')
-        if not input_field.Exists(0.1):
-            raise Exception("未找到聊天输入框")
-            
-        # 使用 SetFocus() 代替 Click()，避免移动物理鼠标或模拟鼠标点击的延迟
+        """发送消息到当前已激活的聊天窗口"""
+        # 确保微信在前台
+        try:
+            win32gui.SetForegroundWindow(self.HWND)
+        except Exception:
+            pass
+
+        input_field = self._find_input_field(timeout=0.15)
+        if not input_field:
+            raise Exception("未找到聊天输入框，请确认群聊窗口已正确打开")
+
         input_field.SetFocus()
-        
-        # 使用原生 Win32 API 极速写入剪贴板
         set_clipboard_text(msg)
-        
-        # 使用 Win32 API 原生 keybd_event 零延迟模拟键盘操作，彻底消除 uiautomation SendKeys 内置的 120ms+ 延时
-        # 模拟 Ctrl+A
+
+        # 原生 Win32 keybd_event 零延迟模拟键盘，消除 uiautomation SendKeys 内置的 120ms+ 延时
         win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
         win32api.keybd_event(ord('A'), 0, 0, 0)
         win32api.keybd_event(ord('A'), 0, win32con.KEYEVENTF_KEYUP, 0)
         win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-        
-        # 模拟 Delete
+
         win32api.keybd_event(win32con.VK_DELETE, 0, 0, 0)
         win32api.keybd_event(win32con.VK_DELETE, 0, win32con.KEYEVENTF_KEYUP, 0)
-        
-        # 模拟 Ctrl+V
+
         win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
         win32api.keybd_event(ord('V'), 0, 0, 0)
         win32api.keybd_event(ord('V'), 0, win32con.KEYEVENTF_KEYUP, 0)
         win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-        
-        # 根据文本长度动态计算极短的粘贴等待时间，防止长文本在微信里未完成粘贴便敲下回车发送
+
         paste_delay = max(0.005, min(0.05, len(msg) * 0.0001))
         time.sleep(paste_delay)
-        
-        # 模拟 Enter
+
         win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
         win32api.keybd_event(win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0)
 
     def GetCurrentActiveChatName(self):
-        # 优先使用缓存的标题栏进行极速检测，如果失效或未加载则执行延迟绑定
+        """读取当前打开的聊天窗口名称（多候选标题栏查找）"""
+        # 尝试缓存的标题栏
         if not self.chat_title_bar:
-            self.chat_title_bar = self.control.GroupControl(ClassName='mmui::ChatTitleBarMasterView')
-            if not self.chat_title_bar.Exists(0.1):
-                self.chat_title_bar = None
-                return None
-        
-        label = self.chat_title_bar.TextControl(ClassName='mmui::XTextView')
-        if label.Exists(0.05):
-            return label.Name
+            self.chat_title_bar = self._find_control_multi(
+                [("group", {"ClassName": "mmui::ChatTitleBarMasterView"}),
+                 ("group", {"ClassName": "TitleBarView"}),
+                 ("group", {"AutomationId": "chat_title_bar"})],
+                timeout=0.1
+            )
+        if not self.chat_title_bar:
+            return None
+
+        # 多候选读取标题文字
+        for kwargs in [{"ClassName": "mmui::XTextView"}, {"ClassName": "XTextView"}, {}]:
+            try:
+                label = self.chat_title_bar.TextControl(**kwargs)
+                if label.Exists(0.05):
+                    return label.Name
+            except Exception:
+                continue
         return None
 
-
     def GetLastMessage(self, who):
-        # 每次都执行 50ms 极短超时搜索，基于 session_list 限定查找以防超时
-        session = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
-        if not session.Exists(0.05):
+        """从会话列表读取指定群的最后一条消息（发送者, 内容）"""
+        # 路径1：AutomationId 精确查找（新版Qt微信）
+        session = None
+        try:
+            s = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
+            if s.Exists(0.05):
+                session = s
+        except Exception:
+            pass
+
+        # 路径2：Name 模糊匹配（旧版微信）
+        if not session:
+            try:
+                items = self.session_list.GetChildren()
+                for item in items:
+                    try:
+                        if who in item.Name:
+                            session = item
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if not session:
             return None, None
-            
+
         try:
             name = session.Name
         except Exception:
             return None, None
-            
+
         lines = [l.strip() for l in name.split('\n') if l.strip()]
         if not lines or len(lines) < 2:
             return None, None
-            
-        # 微信会话单元格中，最后一条消息的内容总是位于时间线（最后一行）的上一行
+
         msg_line = lines[-2]
-        
         if ':' in msg_line:
             parts = msg_line.split(':', 1)
             sender = parts[0].strip()
@@ -212,7 +337,9 @@ class WeChatBotWxAutoGUI:
         
         # 消息同步队列与后台线程
         self.gui_queue = queue.Queue()
+        self.reply_queue = queue.Queue()  # 串行发送任务队列（彻底消除并发冲突）
         self.listener_thread = None
+        self.sender_thread = None
         self.is_listening = False
         self.last_msg_sigs = {}   # 各群最新消息签名映射表
         
@@ -616,10 +743,13 @@ class WeChatBotWxAutoGUI:
             self.btn_action.config(state="normal")
             self.log("微信绑定成功！请在左侧配置目标群聊并点击【启动秒回监控】。")
             
-            # 开启后台循环接收线程
+            # 开启后台监听线程
             self.is_listening = True
             self.listener_thread = threading.Thread(target=self.background_listener, daemon=True)
             self.listener_thread.start()
+            # 开启串行发送 Worker 线程（唯一操作剪贴板/键盘的线程，消除并发冲突）
+            self.sender_thread = threading.Thread(target=self.sender_worker, daemon=True)
+            self.sender_thread.start()
             
         except Exception as e:
             self.is_connected = False
@@ -678,12 +808,9 @@ class WeChatBotWxAutoGUI:
                                                 content_matched = True
                                                 
                                         if content_matched:
-                                            # 极致优化：直接在此处（后台线程）同步触发发送专属回复内容
-                                            threading.Thread(
-                                                target=self.do_fast_reply, 
-                                                args=(room, content, rule['reply']), 
-                                                daemon=True
-                                            ).start()
+                                            # 将回复任务投入串行发送队列，由 sender_worker 串行处理
+                                            # 避免多线程并发抢夺剪贴板和键盘焦点导致消息乱序或延迟
+                                            self.reply_queue.put((room, content, rule['reply']))
                 except Exception as e:
                     pass
                 
@@ -707,26 +834,53 @@ class WeChatBotWxAutoGUI:
             if len(self.tree.get_children()) > 100:
                 self.tree.delete(self.tree.get_children()[-1])
 
-    def do_fast_reply(self, chat, incoming_content, reply_text):
-        try:
-            start_time = time.time()
-            
-            # 动态检测当前窗口，若不同则快速切换
-            current_active = self.wx.GetCurrentActiveChatName()
-            if current_active != chat:
-                self.wx.ChatWith(chat)
-                
-            if self.safe_mode.get():
-                time.sleep(0.1 + random.random() * 0.2)
-                
-            # 发送该规则对应的专属回复
-            self.wx.SendMsg(msg=reply_text)
-            
-            end_time = time.time()
-            elapsed = (end_time - start_time) * 1000
-            self.root.after(0, lambda: self.log(f"【成功秒回】群聊: '{chat}' | 发言: '{incoming_content}' | 关联总耗时: {elapsed:.2f}毫秒"))
-        except Exception as e:
-            self.root.after(0, lambda: self.log(f"秒回发送失败，错误: {e}"))
+    def sender_worker(self):
+        """串行发送 Worker：唯一操作剪贴板和键盘的线程，彻底消除并发冲突"""
+        _last_sent_chat = None  # 本地缓存当前已在哪个群窗口，避免 UIA 标题栏查询
+        while self.is_listening:
+            try:
+                # 阻塞等待发送任务，超时 0.5s 循环检查 is_listening 状态
+                try:
+                    item = self.reply_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                # None 是退出哨兵信号（on_closing 发送）
+                if item is None:
+                    self.reply_queue.task_done()
+                    break
+
+                chat, incoming_content, reply_text = item
+
+                if not self.wx or not self.is_monitoring:
+                    self.reply_queue.task_done()
+                    continue
+
+                start_time = time.time()
+                try:
+                    # 只有当目标群和当前窗口不同时才切换，减少不必要的窗口切换
+                    if _last_sent_chat != chat:
+                        self.wx.ChatWith(chat)
+                        _last_sent_chat = chat
+
+                    if self.safe_mode.get():
+                        time.sleep(0.1 + random.random() * 0.2)
+
+                    self.wx.SendMsg(msg=reply_text)
+
+                    elapsed = (time.time() - start_time) * 1000
+                    # 通过线程安全的 after 回调更新 GUI 日志
+                    _chat, _content, _elapsed = chat, incoming_content, elapsed
+                    self.root.after(0, lambda c=_chat, m=_content, e=_elapsed:
+                        self.log(f"【成功秒回】群聊: '{c}' | 发言: '{m}' | 关联总耗时: {e:.2f}毫秒"))
+                except Exception as e:
+                    _last_sent_chat = None  # 发送失败时重置缓存，下次强制重新切换
+                    _e = e
+                    self.root.after(0, lambda err=_e: self.log(f"秒回发送失败，错误: {err}"))
+                finally:
+                    self.reply_queue.task_done()
+            except Exception:
+                pass
 
     def on_tree_double_click(self, event):
         # 双击表格中的行，自动载入表单
@@ -932,6 +1086,9 @@ class WeChatBotWxAutoGUI:
 
     def on_closing(self):
         self.is_listening = False
+        self.is_monitoring = False
+        # 发送 None 哨兵让 sender_worker 快速退出阻塞等待
+        self.reply_queue.put(None)
         self.root.destroy()
         sys.exit(0)
 
