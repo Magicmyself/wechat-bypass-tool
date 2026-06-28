@@ -58,13 +58,15 @@ class WeChatNT:
         def callback(hwnd, extra):
             nonlocal wechat_hwnd
             classname = win32gui.GetClassName(hwnd)
-            if classname == 'Qt51514QWindowIcon':
+            is_qt_wechat = classname.startswith('Qt') and classname.endswith('QWindowIcon')
+            is_legacy_wechat = classname == 'WeChatMainWndForPC'
+            if is_qt_wechat or is_legacy_wechat:
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
                     proc = psutil.Process(pid)
                     if proc.name().lower() == 'weixin.exe':
                         title = win32gui.GetWindowText(hwnd)
-                        if '微信' in title or title == '微信':
+                        if '微信' in title or title == '微信' or 'WeChat' in title:
                             wechat_hwnd = hwnd
                 except Exception:
                     pass
@@ -188,8 +190,8 @@ class WeChatBotWxAutoGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("微信消息极速秒回助手 - UIA驱动版 (支持最新微信)")
-        self.root.geometry("900x650")
-        self.root.minsize(800, 550)
+        self.root.geometry("1150x700")
+        self.root.minsize(1000, 550)
         
         # 内部状态变量
         self.wx = None
@@ -197,9 +199,16 @@ class WeChatBotWxAutoGUI:
         self.is_monitoring = False
         
         self.rules = []           # 规则库配置列表，格式如：{"room":x, "sender":y, "mode":z, "keywords":[], "reply":w}
-        self.target_rooms = []    # 提取的唯一群聊列表
+        self.rules_lock = threading.Lock() # 线程锁，保证规则读写安全
+        self.load_rules()         # 从本地加载规则库
+        self.target_rooms = []    # 提取 of unique monitored group list
         self.safe_mode = tk.BooleanVar(value=True)
         self.current_active_room = None
+        
+        # 快捷短语与记录板数据初始化
+        self.snippets = []
+        self.snippets_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat_snippets.json")
+        self.load_snippets()
         
         # 消息同步队列与后台线程
         self.gui_queue = queue.Queue()
@@ -325,6 +334,59 @@ class WeChatBotWxAutoGUI:
         self.btn_action = ttk.Button(left_frame, text=" 第二步：启动秒回监控 ", style="Success.TButton", state="disabled", command=self.toggle_monitoring)
         self.btn_action.grid(row=12, column=0, columnspan=2, sticky="we", pady=5)
 
+        # 中间面板：快捷文本记录板
+        middle_frame = ttk.LabelFrame(main_pane, text=" 快捷文本记录板 ", padding=10)
+        main_pane.add(middle_frame, weight=1)
+        middle_frame.columnconfigure(0, weight=1)
+        middle_frame.columnconfigure(1, weight=1)
+        middle_frame.rowconfigure(6, weight=1)
+        
+        # 1. 便签草稿箱
+        ttk.Label(middle_frame, text="便签草稿箱 (临时文本编辑与交换):").grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
+        self.txt_scratchpad = scrolledtext.ScrolledText(middle_frame, height=6, font=("微软雅黑", 9))
+        self.txt_scratchpad.grid(row=1, column=0, columnspan=2, sticky="we", pady=2)
+        
+        # 草稿箱操作按钮
+        btn_copy_scratch = ttk.Button(middle_frame, text=" 复制全部草稿 ", command=self.copy_scratchpad)
+        btn_copy_scratch.grid(row=2, column=0, sticky="we", padx=(0, 2), pady=2)
+        
+        btn_save_snippet = ttk.Button(middle_frame, text=" 存为快捷短语 ", command=self.save_scratchpad_to_snippet)
+        btn_save_snippet.grid(row=2, column=1, sticky="we", padx=(2, 0), pady=2)
+        
+        btn_clear_scratch = ttk.Button(middle_frame, text=" 清空草稿 ", command=self.clear_scratchpad)
+        btn_clear_scratch.grid(row=3, column=0, columnspan=2, sticky="we", pady=2)
+        
+        # 分割线
+        ttk.Separator(middle_frame, orient="horizontal").grid(row=4, column=0, columnspan=2, sticky="we", pady=8)
+        
+        # 2. 快捷短语列表
+        ttk.Label(middle_frame, text="快捷短语库 (双击可直接复制):").grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
+        
+        self.snippets_tree = ttk.Treeview(middle_frame, columns=("content",), show="headings", height=8)
+        self.snippets_tree.heading("content", text="短语内容")
+        self.snippets_tree.column("content", width=150, anchor="w")
+        self.snippets_tree.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=2)
+        
+        # 短语列表滚动条
+        snippets_ysb = ttk.Scrollbar(middle_frame, orient="vertical", command=self.snippets_tree.yview)
+        self.snippets_tree.configure(yscroll=snippets_ysb.set)
+        snippets_ysb.grid(row=6, column=2, sticky="ns", pady=2)
+        
+        self.snippets_tree.bind("<Double-1>", self.on_snippet_double_click)
+        
+        # 快捷短语操作按钮
+        btn_copy_snippet = ttk.Button(middle_frame, text=" 复制选中短语 ", command=self.copy_selected_snippet)
+        btn_copy_snippet.grid(row=7, column=0, sticky="we", padx=(0, 2), pady=2)
+        
+        btn_del_snippet = ttk.Button(middle_frame, text=" 删除选中短语 ", command=self.delete_selected_snippet)
+        btn_del_snippet.grid(row=7, column=1, sticky="we", padx=(2, 0), pady=2)
+        
+        btn_to_reply = ttk.Button(middle_frame, text=" 导入至规则回复内容 ", command=self.import_snippet_to_reply)
+        btn_to_reply.grid(row=8, column=0, columnspan=2, sticky="we", pady=2)
+        
+        # 初始化刷新一次短语列表
+        self.refresh_snippets_tree()
+
         # 右侧面板：实时群消息监听与日志 (用于抓取昵称)
         right_frame = ttk.LabelFrame(main_pane, text=" 锁定群聊消息面板（双击下方任意行可自动填入配置） ", padding=10)
         main_pane.add(right_frame, weight=2)
@@ -360,6 +422,7 @@ class WeChatBotWxAutoGUI:
         self.log_area.pack(fill="x", expand=True)
         
         self.log("系统就绪，请先点击【第一步：连接并绑定当前微信】按钮。")
+        self.refresh_rules_tree() # 启动时刷新展示加载好的规则库
 
     def log(self, text):
         t_str = time.strftime('%H:%M:%S')
@@ -379,9 +442,13 @@ class WeChatBotWxAutoGUI:
         for item in self.rules_tree.get_children():
             self.rules_tree.delete(item)
         # 重新插入所有规则
-        for r in self.rules:
+        with self.rules_lock:
+            rules_copy = list(self.rules)
+        for r in rules_copy:
             kws = ", ".join(r['keywords']) if r['keywords'] else "-"
-            self.rules_tree.insert("", "end", values=(r['room'], r['sender'], r['mode'], kws, r['reply']))
+            # 替换换行符，防止 Treeview 表格中多行文本重叠显示
+            reply_preview = r['reply'].replace('\n', ' ↵ ')
+            self.rules_tree.insert("", "end", values=(r['room'], r['sender'], r['mode'], kws, reply_preview))
 
     def add_or_update_rule(self):
         room = self.ent_room.get().strip()
@@ -400,13 +467,6 @@ class WeChatBotWxAutoGUI:
             
         keywords = [k.strip() for k in keywords_raw.replace("，", ",").split(",") if k.strip()]
         
-        # 检查是否已存在该群聊+发言人的规则 (如果存在则更新，否则新增)
-        existing_idx = -1
-        for idx, r in enumerate(self.rules):
-            if r['room'] == room and r['sender'] == sender:
-                existing_idx = idx
-                break
-                
         rule_data = {
             "room": room,
             "sender": sender,
@@ -415,14 +475,27 @@ class WeChatBotWxAutoGUI:
             "reply": reply
         }
         
-        if existing_idx >= 0:
-            self.rules[existing_idx] = rule_data
-            self.log(f"已更新规则 -> 群聊: {room} | 发言人: {sender}")
-        else:
-            self.rules.append(rule_data)
-            self.log(f"已添加规则 -> 群聊: {room} | 发言人: {sender}")
+        with self.rules_lock:
+            # 检查是否已存在该群聊+发言人的规则 (如果存在则更新，否则新增)
+            existing_idx = -1
+            for idx, r in enumerate(self.rules):
+                if r['room'] == room and r['sender'] == sender:
+                    existing_idx = idx
+                    break
+                    
+            if existing_idx >= 0:
+                self.rules[existing_idx] = rule_data
+                self.log(f"已更新规则 -> 群聊: {room} | 发言人: {sender}")
+            else:
+                self.rules.append(rule_data)
+                self.log(f"已添加规则 -> 群聊: {room} | 发言人: {sender}")
             
+        self.save_rules()
         self.refresh_rules_tree()
+        
+        # 如果正在监控，动态更新监控的房间
+        if self.is_monitoring:
+            self.update_monitoring_rooms_dynamically()
         
         # 清空表单，方便输入下一条规则
         self.ent_room.delete(0, "end")
@@ -444,9 +517,51 @@ class WeChatBotWxAutoGUI:
         sender = values[1]
         
         # 从 rules 中删除
-        self.rules = [r for r in self.rules if not (r['room'] == room and r['sender'] == sender)]
+        with self.rules_lock:
+            self.rules = [r for r in self.rules if not (r['room'] == room and r['sender'] == sender)]
         self.log(f"已删除规则 -> 群聊: {room} | 发言人: {sender}")
+        self.save_rules()
         self.refresh_rules_tree()
+
+        # 如果正在监控，动态更新监控的房间
+        if self.is_monitoring:
+            self.update_monitoring_rooms_dynamically()
+
+    def update_monitoring_rooms_dynamically(self):
+        if not self.wx:
+            return
+            
+        with self.rules_lock:
+            new_target_rooms = list(set(r['room'] for r in self.rules))
+        
+        # 找出新增加的群聊和已被移除 of the monitored list
+        added_rooms = [r for r in new_target_rooms if r not in self.target_rooms]
+        removed_rooms = [r for r in self.target_rooms if r not in new_target_rooms]
+        
+        for r in added_rooms:
+            self.log(f"检测到新群聊【{r}】，正在将其加入监控列表并初始化...")
+            sender_init, content_init = self.wx.GetLastMessage(r)
+            if sender_init is None and content_init is None:
+                try:
+                    self.wx.ChatWith(r)
+                    time.sleep(0.2)
+                    sender_init, content_init = self.wx.GetLastMessage(r)
+                except Exception as e:
+                    self.log(f"警告：初始化新群聊【{r}】失败，请确保该群在微信聊天列表中或名称完全正确！错误: {e}")
+            
+            if sender_init and content_init:
+                self.last_msg_sigs[r] = f"{sender_init}:{content_init}"
+            else:
+                self.last_msg_sigs[r] = ""
+            self.log(f"新群聊【{r}】初始化完成。")
+            
+        for r in removed_rooms:
+            self.log(f"已移出监控群聊：【{r}】")
+            if r in self.last_msg_sigs:
+                del self.last_msg_sigs[r]
+                
+        self.target_rooms = new_target_rooms
+        self.log(f"监控列表已动态更新，当前共监控 {len(self.target_rooms)} 个群聊。")
 
     def load_rule_to_form(self, event=None):
         selected = self.rules_tree.selection()
@@ -459,7 +574,17 @@ class WeChatBotWxAutoGUI:
             sender = values[1]
             mode = values[2]
             kws = values[3]
-            reply = values[4]
+            
+            # 从 rules 列表中匹配获取最原始的带换行符的回复内容
+            original_reply = ""
+            with self.rules_lock:
+                for r in self.rules:
+                    if r['room'] == room and r['sender'] == sender:
+                        original_reply = r['reply']
+                        break
+            if not original_reply:
+                # 兜底：如果没找到，使用表格里的值，但需要把 ↵ 换回换行符
+                original_reply = values[4].replace(' ↵ ', '\n')
             
             self.ent_room.delete(0, "end")
             self.ent_room.insert(0, room)
@@ -475,7 +600,7 @@ class WeChatBotWxAutoGUI:
                 self.ent_keywords.insert(0, kws)
                 
             self.txt_reply.delete("1.0", "end")
-            self.txt_reply.insert("1.0", reply)
+            self.txt_reply.insert("1.0", original_reply)
             
             self.log(f"已加载规则至编辑器 -> 群聊: {room} | 发言人: {sender}")
 
@@ -510,11 +635,15 @@ class WeChatBotWxAutoGUI:
                 time.sleep(1)
                 continue
             
-            if not self.is_monitoring or not self.rules:
+            with self.rules_lock:
+                current_rules = list(self.rules)
+                
+            if not self.is_monitoring or not current_rules:
                 time.sleep(0.5)
                 continue
                 
-            for room in self.target_rooms:
+            current_target_rooms = list(self.target_rooms)
+            for room in current_target_rooms:
                 if not self.is_monitoring:
                     break
                     
@@ -530,7 +659,7 @@ class WeChatBotWxAutoGUI:
                             self.gui_queue.put((room, sender, content, 'friend'))
                             
                             # 遍历规则库寻找匹配规则
-                            for rule in self.rules:
+                            for rule in current_rules:
                                 if rule['room'] == room:
                                     # 1. 校验发言人是否符合规则
                                     if rule['sender'] == '*' or rule['sender'] == sender:
@@ -571,8 +700,10 @@ class WeChatBotWxAutoGUI:
         t_str = time.strftime('%H:%M:%S')
         
         if m_type == 'friend':
+            # 替换换行符，防止多行文本在表格行中重叠
+            content_preview = content.replace('\n', ' ↵ ')
             # 仅在表格中展示日志
-            self.tree.insert("", 0, values=(t_str, sender, chat, content))
+            self.tree.insert("", 0, values=(t_str, sender, chat, content_preview))
             if len(self.tree.get_children()) > 100:
                 self.tree.delete(self.tree.get_children()[-1])
 
@@ -618,12 +749,15 @@ class WeChatBotWxAutoGUI:
 
     def toggle_monitoring(self):
         if not self.is_monitoring:
-            if not self.rules:
+            with self.rules_lock:
+                rules_empty = len(self.rules) == 0
+            if rules_empty:
                 messagebox.showwarning("规则库为空", "请先在规则库中添加至少一条秒回规则！")
                 return
                 
             # 提取所有唯一的监控群聊
-            self.target_rooms = list(set(r['room'] for r in self.rules))
+            with self.rules_lock:
+                self.target_rooms = list(set(r['room'] for r in self.rules))
             self.last_msg_sigs = {}
             self.current_active_room = None
             
@@ -650,31 +784,151 @@ class WeChatBotWxAutoGUI:
             self.is_monitoring = True
             self.btn_action.config(text=" 停止秒回监控 ", style="Danger.TButton")
             
-            # 禁用所有编辑器控件与表单
-            self.ent_room.config(state="disabled")
-            self.ent_sender.config(state="disabled")
-            self.cmb_mode.config(state="disabled")
-            self.ent_keywords.config(state="disabled")
-            self.txt_reply.config(state="disabled")
-            self.btn_add_rule.config(state="disabled")
-            self.btn_del_rule.config(state="disabled")
+            # 不再禁用编辑器控件与表单，允许用户随时修改规则
             
-            self.log(f"▶ 秒回监控已开启！当前共运行 {len(self.rules)} 条秒回规则。")
+            with self.rules_lock:
+                rules_count = len(self.rules)
+            self.log(f"▶ 秒回监控已开启！当前共运行 {rules_count} 条秒回规则。")
         else:
             self.is_monitoring = False
             self.btn_action.config(text=" 第二步：启动秒回监控 ", style="Success.TButton")
             
-            # 恢复编辑器控件与表单
-            self.ent_room.config(state="normal")
-            self.ent_sender.config(state="normal")
-            self.cmb_mode.config(state="normal")
-            if self.cmb_mode.get() != "无条件秒回 (任意内容)":
-                self.ent_keywords.config(state="normal")
-            self.txt_reply.config(state="normal")
-            self.btn_add_rule.config(state="normal")
-            self.btn_del_rule.config(state="normal")
-            
             self.log("⏸ 秒回监控已暂停。")
+
+    def load_snippets(self):
+        import json
+        self.snippets = []
+        if os.path.exists(self.snippets_file):
+            try:
+                with open(self.snippets_file, "r", encoding="utf-8") as f:
+                    self.snippets = json.load(f)
+            except Exception as e:
+                print(f"加载快捷短语失败: {e}")
+        else:
+            # 默认快捷短语
+            self.snippets = [
+                "你好，请问有什么可以帮您？",
+                "好的，稍等一下，我马上为您处理。",
+                "请把具体错误截图或要求发给我看下。",
+                "测试自动秒回中，请发送消息测试。"
+            ]
+            self.save_snippets()
+
+    def save_snippets(self):
+        import json
+        try:
+            with open(self.snippets_file, "w", encoding="utf-8") as f:
+                json.dump(self.snippets, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"保存快捷短语失败: {e}")
+
+    def load_rules(self):
+        import json
+        self.rules = []
+        rules_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat_rules.json")
+        if os.path.exists(rules_file):
+            try:
+                with open(rules_file, "r", encoding="utf-8") as f:
+                    self.rules = json.load(f)
+            except Exception as e:
+                print(f"加载规则库失败: {e}")
+
+    def save_rules(self):
+        import json
+        rules_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat_rules.json")
+        try:
+            with open(rules_file, "w", encoding="utf-8") as f:
+                json.dump(self.rules, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"保存规则库失败: {e}")
+
+    def copy_scratchpad(self):
+        text = self.txt_scratchpad.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showwarning("内容为空", "便签草稿箱中没有内容！")
+            return
+        set_clipboard_text(text)
+        self.log("【已复制】已将便签草稿内容复制到系统剪贴板。")
+
+    def save_scratchpad_to_snippet(self):
+        text = self.txt_scratchpad.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showwarning("内容为空", "不能将空文本存为快捷短语！")
+            return
+        if text in self.snippets:
+            messagebox.showinfo("提示", "该短语已存在于短语库中。")
+            return
+        self.snippets.append(text)
+        self.save_snippets()
+        self.refresh_snippets_tree()
+        self.log(f"【添加短语】成功保存短语：'{text[:15]}...'")
+
+    def clear_scratchpad(self):
+        self.txt_scratchpad.delete("1.0", "end")
+        self.log("便签草稿箱已清空。")
+
+    def refresh_snippets_tree(self):
+        # 清空树形控件
+        for item in self.snippets_tree.get_children():
+            self.snippets_tree.delete(item)
+        # 重新插入，values中存储替换了换行符的单行预览，iid存储其在self.snippets中的索引位置
+        for idx, s in enumerate(self.snippets):
+            preview = s.replace('\n', ' ↵ ')
+            self.snippets_tree.insert("", "end", iid=str(idx), values=(preview,))
+
+    def on_snippet_double_click(self, event):
+        selected = self.snippets_tree.selection()
+        if not selected:
+            return
+        try:
+            idx = int(selected[0])
+            snippet_text = self.snippets[idx]
+            set_clipboard_text(snippet_text)
+            self.log(f"【双击复制】已将短语复制到剪贴板: '{snippet_text[:15]}...'")
+        except Exception as e:
+            pass
+
+    def copy_selected_snippet(self):
+        selected = self.snippets_tree.selection()
+        if not selected:
+            messagebox.showwarning("未选中", "请先在短语库中选中一行！")
+            return
+        try:
+            idx = int(selected[0])
+            snippet_text = self.snippets[idx]
+            set_clipboard_text(snippet_text)
+            self.log(f"【复制短语】已将短语复制到剪贴板: '{snippet_text[:15]}...'")
+        except Exception as e:
+            messagebox.showerror("错误", f"无法复制短语: {e}")
+
+    def delete_selected_snippet(self):
+        selected = self.snippets_tree.selection()
+        if not selected:
+            messagebox.showwarning("未选中", "请先在短语库中选中要删除的行！")
+            return
+        try:
+            idx = int(selected[0])
+            snippet_text = self.snippets[idx]
+            self.snippets.remove(snippet_text)
+            self.save_snippets()
+            self.refresh_snippets_tree()
+            self.log(f"【删除短语】已从短语库删除：'{snippet_text[:15]}...'")
+        except Exception as e:
+            messagebox.showerror("错误", f"无法删除短语: {e}")
+
+    def import_snippet_to_reply(self):
+        selected = self.snippets_tree.selection()
+        if not selected:
+            messagebox.showwarning("未选中", "请先在短语库中选中一行短语！")
+            return
+        try:
+            idx = int(selected[0])
+            snippet_text = self.snippets[idx]
+            self.txt_reply.delete("1.0", "end")
+            self.txt_reply.insert("1.0", snippet_text)
+            self.log(f"【导入成功】已将短语导入到左侧“专属秒回回复内容”编辑器。")
+        except Exception as e:
+            messagebox.showerror("错误", f"无法导入短语: {e}")
 
     def on_closing(self):
         self.is_listening = False

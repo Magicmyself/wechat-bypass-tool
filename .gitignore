@@ -43,3 +43,7 @@ ENV/
 # IDE files
 .vscode/
 .idea/
+
+# Local databases (Notepad / Rules)
+wechat_rules.json
+wechat_snippets.json

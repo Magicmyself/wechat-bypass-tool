@@ -12,14 +12,15 @@ def get_wechat_hwnd():
     def callback(hwnd, extra):
         nonlocal wechat_hwnd
         classname = win32gui.GetClassName(hwnd)
-        if classname == 'Qt51514QWindowIcon':
+        is_qt_wechat = classname.startswith('Qt') and classname.endswith('QWindowIcon')
+        is_legacy_wechat = classname == 'WeChatMainWndForPC'
+        if is_qt_wechat or is_legacy_wechat:
             try:
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 proc = psutil.Process(pid)
                 if proc.name().lower() == 'weixin.exe':
-                    # 只通过进程名和类名判断，避免中文编码比对失败
                     title = win32gui.GetWindowText(hwnd)
-                    if title: # 微信主窗口通常有标题（可能是“微信”或用户名）
+                    if '微信' in title or title == '微信' or 'WeChat' in title or title:
                         wechat_hwnd = hwnd
             except Exception:
                 pass

@@ -10,14 +10,17 @@ import psutil
 def get_wechat_hwnd():
     wechat_hwnd = None
     def callback(hwnd, extra):
+        nonlocal wechat_hwnd
         classname = win32gui.GetClassName(hwnd)
-        if classname == 'Qt51514QWindowIcon':
+        is_qt_wechat = classname.startswith('Qt') and classname.endswith('QWindowIcon')
+        is_legacy_wechat = classname == 'WeChatMainWndForPC'
+        if is_qt_wechat or is_legacy_wechat:
             try:
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 proc = psutil.Process(pid)
                 if proc.name().lower() == 'weixin.exe':
                     title = win32gui.GetWindowText(hwnd)
-                    if '微信' in title or title == '微信':
+                    if '微信' in title or title == '微信' or 'WeChat' in title:
                         wechat_hwnd = hwnd
             except Exception:
                 pass
