@@ -247,6 +247,28 @@ class WeChatNT:
             return re.sub(r'[\s\(\)（）\d]+', '', s).lower()
         who_normalized = clean_str(who)
 
+        # 路径0：尝试使用已缓存的 session_list 项，实现 0ms 定位与极速点击
+        if hasattr(self, '_session_cache') and who in self._session_cache:
+            try:
+                session = self._session_cache[who]
+                if session.Exists(0):
+                    rect = session.BoundingRectangle
+                    if rect.width > 0 and rect.height > 0:
+                        session.Click(simulateMove=False, waitTime=0)
+                        
+                        # 轮询标题栏直到与目标匹配，防止微信切换渲染延迟
+                        start_wait = time.time()
+                        while time.time() - start_wait < 0.3:
+                            curr = self.GetCurrentActiveChatName() or ""
+                            if who_normalized in clean_str(curr):
+                                break
+                            time.sleep(0.005)
+                            
+                        self._current_chat = who
+                        return True
+            except Exception:
+                pass
+
         # 路径1：从 session_list 直接按 AutomationId 点击（新版Qt微信）
         try:
             session = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
@@ -254,6 +276,10 @@ class WeChatNT:
                 rect = session.BoundingRectangle
                 if rect.width > 0 and rect.height > 0:
                     session.Click(simulateMove=False, waitTime=0)
+                    
+                    if not hasattr(self, '_session_cache'):
+                        self._session_cache = {}
+                    self._session_cache[who] = session
                     
                     # 轮询标题栏直到与目标匹配，防止微信切换渲染延迟导致消息发送到前一个窗口
                     start_wait = time.time()
@@ -279,6 +305,10 @@ class WeChatNT:
                         rect = item.BoundingRectangle
                         if rect.width > 0 and rect.height > 0:
                             item.Click(simulateMove=False, waitTime=0)
+                            
+                            if not hasattr(self, '_session_cache'):
+                                self._session_cache = {}
+                            self._session_cache[who] = item
                             
                             # 轮询标题栏直到与目标匹配
                             start_wait = time.time()
@@ -398,13 +428,29 @@ class WeChatNT:
     def GetLastMessage(self, who):
         """从会话列表读取指定群的最后一条消息（发送者, 内容）"""
         session = None
-        try:
-            s = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
-            if s.Exists(0):
-                session = s
-        except Exception:
-            pass
+        
+        # 1. 尝试从缓存中获取会话项，实现 0ms 极其迅速的读取
+        if hasattr(self, '_session_cache') and who in self._session_cache:
+            s = self._session_cache[who]
+            try:
+                if s.Exists(0):
+                    session = s
+            except Exception:
+                del self._session_cache[who]
 
+        # 2. 缓存失效或无缓存时，尝试直接通过 AutomationId 获取
+        if not session:
+            try:
+                s = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
+                if s.Exists(0):
+                    session = s
+                    if not hasattr(self, '_session_cache'):
+                        self._session_cache = {}
+                    self._session_cache[who] = session
+            except Exception:
+                pass
+
+        # 3. 模糊匹配回退，只在直接获取失败时运行一次
         if not session:
             try:
                 who_clean = re.sub(r'\s+', '', who).lower()
@@ -414,6 +460,9 @@ class WeChatNT:
                         name_clean = re.sub(r'\s+', '', item.Name).lower()
                         if who_clean in name_clean:
                             session = item
+                            if not hasattr(self, '_session_cache'):
+                                self._session_cache = {}
+                            self._session_cache[who] = session
                             break
                     except Exception:
                         continue
