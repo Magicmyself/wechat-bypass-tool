@@ -244,7 +244,7 @@ class WeChatNT:
             if session.Exists(0):
                 rect = session.BoundingRectangle
                 if rect.width > 0 and rect.height > 0:
-                    session.Select(waitTime=0)
+                    session.Click(simulateMove=False, waitTime=0)
                     self._current_chat = who
                     return True
         except Exception:
@@ -258,7 +258,7 @@ class WeChatNT:
                     if who in item.Name:
                         rect = item.BoundingRectangle
                         if rect.width > 0 and rect.height > 0:
-                            item.Select(waitTime=0)
+                            item.Click(simulateMove=False, waitTime=0)
                             self._current_chat = who
                             return True
                 except Exception:
