@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import time
 import random
 import threading
@@ -26,6 +27,28 @@ def set_clipboard_text(text):
         win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
     finally:
         win32clipboard.CloseClipboard()
+
+def is_time_string(s):
+    s = s.strip()
+    # 1. 匹配 HH:MM 或 H:MM
+    if re.match(r'^\d{1,2}[:：]\d{2}$', s):
+        return True
+    # 2. 匹配 上午/下午/AM/PM + HH:MM
+    if re.match(r'^(上午|下午|AM|PM)\s*\d{1,2}[:：]\d{2}$', s):
+        return True
+    # 3. 匹配 昨天, 前天
+    if s in ["昨天", "前天"]:
+        return True
+    # 4. 匹配 星期一 到 星期日，周一 到 周日
+    if re.match(r'^(星期|周)[一二三四五六日]$', s):
+        return True
+    # 5. 匹配 日期格式 2026/06/29, 2026-06-29, 26/6/29, 6月29日 等
+    if re.match(r'^\d{2,4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?$', s):
+        return True
+    # 6. 匹配仅月日 06-29, 6/29
+    if re.match(r'^\d{1,2}[-/.月]\d{1,2}日?$', s):
+        return True
+    return False
 
 class WeChatNT:
     def __init__(self):
@@ -357,10 +380,28 @@ class WeChatNT:
             return None, None
 
         lines = [l.strip() for l in name.split('\n') if l.strip()]
-        if not lines or len(lines) < 2:
+        if not lines:
             return None, None
 
-        msg_line = lines[-2]
+        # 寻找时间行作为锚点，获取时间行前的一行作为消息内容行
+        msg_line = None
+        for idx, line in enumerate(lines):
+            if is_time_string(line):
+                if idx > 0:
+                    msg_line = lines[idx - 1]
+                break
+        
+        # 备选回退方案：如果无法识别时间行，则通过排除已知后缀进行回退
+        if msg_line is None:
+            temp_lines = [l for l in lines if l not in ['消息免打扰', '已置顶', 'Mute']]
+            if len(temp_lines) >= 2:
+                msg_line = temp_lines[-2]
+            else:
+                msg_line = lines[-1]
+
+        if not msg_line:
+            return None, None
+
         if ':' in msg_line:
             parts = msg_line.split(':', 1)
             sender = parts[0].strip()
@@ -373,6 +414,7 @@ class WeChatNT:
             return sender, content
         else:
             return "", msg_line
+
 
 class WeChatBotWxAutoGUI:
     def __init__(self, root):
