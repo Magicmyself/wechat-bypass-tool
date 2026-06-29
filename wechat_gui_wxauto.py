@@ -125,9 +125,13 @@ class WeChatNT:
 
     def check_connection(self):
         """检查并自动修复 UIA 连接，确保长效监控稳定性"""
-        current_hwnd = self.get_wechat_hwnd()
-        if not current_hwnd:
-            raise Exception("未找到运行中的微信主窗口")
+        # 如果缓存的 HWND 依然有效，直接使用它，极大降低 CPU/延时开销
+        if hasattr(self, 'HWND') and self.HWND and win32gui.IsWindow(self.HWND):
+            current_hwnd = self.HWND
+        else:
+            current_hwnd = self.get_wechat_hwnd()
+            if not current_hwnd:
+                raise Exception("未找到运行中的微信主窗口")
             
         # 1. 自动恢复最小化的微信窗口，防止其导致 UIA 控件无法被渲染和点击
         if win32gui.IsWindow(self.HWND) and win32gui.IsIconic(self.HWND):
@@ -362,6 +366,14 @@ class WeChatNT:
 
     def GetCurrentActiveChatName(self):
         """读取当前打开的聊天窗口名称（多候选标题栏查找）"""
+        # 如果缓存了标题文本控件且其仍有效，直接读取以实现 0ms 极其迅速的访问
+        if hasattr(self, '_chat_title_label') and self._chat_title_label:
+            try:
+                if self._chat_title_label.Exists(0):
+                    return self._chat_title_label.Name
+            except Exception:
+                self._chat_title_label = None
+
         if not self.chat_title_bar:
             self.chat_title_bar = self._find_control_multi(
                 [("group", {"ClassName": "mmui::ChatTitleBarMasterView"}),
@@ -372,11 +384,12 @@ class WeChatNT:
         if not self.chat_title_bar:
             return None
 
-        # 多候选读取标题文字
-        for kwargs in [{"ClassName": "mmui::XTextView"}, {"ClassName": "XTextView"}, {}]:
+        # 优先使用无条件匹配（最通用，新版微信响应速度最快），找到后缓存控件以供后续复用
+        for kwargs in [{}, {"ClassName": "mmui::XTextView"}, {"ClassName": "XTextView"}]:
             try:
                 label = self.chat_title_bar.TextControl(**kwargs)
                 if label.Exists(0):
+                    self._chat_title_label = label
                     return label.Name
             except Exception:
                 continue
