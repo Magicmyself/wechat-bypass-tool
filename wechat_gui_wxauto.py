@@ -252,10 +252,12 @@ class WeChatNT:
 
         # 路径2：从 session_list 按 Name 匹配（旧版微信或 AutomationId 不存在时）
         try:
+            who_clean = re.sub(r'\s+', '', who).lower()
             items = self.session_list.GetChildren()
             for item in items:
                 try:
-                    if who in item.Name:
+                    name_clean = re.sub(r'\s+', '', item.Name).lower()
+                    if who_clean in name_clean:
                         rect = item.BoundingRectangle
                         if rect.width > 0 and rect.height > 0:
                             item.Click(simulateMove=False, waitTime=0)
@@ -360,10 +362,12 @@ class WeChatNT:
 
         if not session:
             try:
+                who_clean = re.sub(r'\s+', '', who).lower()
                 items = self.session_list.GetChildren()
                 for item in items:
                     try:
-                        if who in item.Name:
+                        name_clean = re.sub(r'\s+', '', item.Name).lower()
+                        if who_clean in name_clean:
                             session = item
                             break
                     except Exception:
@@ -982,9 +986,14 @@ class WeChatBotWxAutoGUI:
                 start_time = time.time()
                 try:
                     # 只有当目标群和当前窗口不同时才切换，减少不必要的窗口切换
-                    if _last_sent_chat != chat:
+                    # 采用标题栏 live 实时校验代替单纯的本地变量缓存，防止用户手动切换窗口导致的状态不同步
+                    current_active = self.wx.GetCurrentActiveChatName() or ""
+                    
+                    def clean_str(s):
+                        return re.sub(r'[\s\(\)（）\d]+', '', s).lower()
+                        
+                    if clean_str(chat) not in clean_str(current_active):
                         self.wx.ChatWith(chat)
-                        _last_sent_chat = chat
 
                     if self.safe_mode.get():
                         time.sleep(0.1 + random.random() * 0.2)
