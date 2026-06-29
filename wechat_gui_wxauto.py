@@ -15,6 +15,9 @@ import pyperclip
 import win32api
 import win32clipboard
 
+# 极致优化：将 uiautomation 操作默认的 500ms 睡眠时间压缩至 10ms，极大降低窗口切换和点击后的额外延时
+uia.uiautomation.OPERATION_WAIT_TIME = 0.01
+
 def set_clipboard_text(text):
     # 使用 Win32 原生 API 极速写入剪贴板，避免 pyperclip 的库环境检查开销
     win32clipboard.OpenClipboard()
@@ -97,7 +100,76 @@ class WeChatNT:
         win32gui.EnumWindows(callback, None)
         return wechat_hwnd
 
-    def _find_input_field(self, timeout=0.15):
+    def check_connection(self):
+        """检查并自动修复 UIA 连接，确保长效监控稳定性"""
+        current_hwnd = self.get_wechat_hwnd()
+        if not current_hwnd:
+            raise Exception("未找到运行中的微信主窗口")
+            
+        # 1. 自动恢复最小化的微信窗口，防止其导致 UIA 控件无法被渲染和点击
+        if win32gui.IsWindow(self.HWND) and win32gui.IsIconic(self.HWND):
+            win32gui.ShowWindow(self.HWND, win32con.SW_RESTORE)
+            time.sleep(0.5)
+            self.control = uia.ControlFromHandle(self.HWND)
+            self.session_list = None
+            self.chat_title_bar = None
+            self.input_field = None
+            
+        rebind_needed = False
+        if current_hwnd != self.HWND:
+            rebind_needed = True
+        else:
+            try:
+                if not self.control.Exists(0):
+                    rebind_needed = True
+            except Exception:
+                rebind_needed = True
+                
+        if rebind_needed:
+            self.HWND = current_hwnd
+            if win32gui.IsIconic(self.HWND):
+                win32gui.ShowWindow(self.HWND, win32con.SW_RESTORE)
+                time.sleep(0.5)
+            self.control = uia.ControlFromHandle(self.HWND)
+            self.session_list = None
+            self.chat_title_bar = None
+            self.input_field = None
+            
+        # 2. 验证并修复 session_list
+        session_list_valid = False
+        if hasattr(self, 'session_list') and self.session_list:
+            try:
+                if self.session_list.Exists(0):
+                    session_list_valid = True
+            except Exception:
+                pass
+                
+        if not session_list_valid:
+            self.session_list = self._find_control_multi(
+                [("list", {"AutomationId": "session_list"}),
+                 ("list", {"ClassName": "SessionList"}),
+                 ("list", {})],
+                timeout=0
+            ) or self.control
+            
+        # 3. 验证并修复标题栏
+        title_valid = False
+        if hasattr(self, 'chat_title_bar') and self.chat_title_bar:
+            try:
+                if self.chat_title_bar.Exists(0):
+                    title_valid = True
+            except Exception:
+                pass
+                
+        if not title_valid:
+            self.chat_title_bar = self._find_control_multi(
+                [("group", {"ClassName": "mmui::ChatTitleBarMasterView"}),
+                 ("group", {"ClassName": "TitleBarView"}),
+                 ("group", {"AutomationId": "chat_title_bar"})],
+                timeout=0
+            )
+
+    def _find_input_field(self, timeout=0):
         """多候选回退：查找聊天输入框"""
         candidates = [
             {"AutomationId": "chat_input_field"},
@@ -111,16 +183,15 @@ class WeChatNT:
                     return f
             except Exception:
                 continue
-        # 最后兜底：查找任意可见 EditControl
         try:
             f = self.control.EditControl()
-            if f.Exists(0.05):
+            if f.Exists(timeout):
                 return f
         except Exception:
             pass
         return None
 
-    def _find_search_box(self, timeout=0.2):
+    def _find_search_box(self, timeout=0):
         """多候选回退：查找微信搜索框"""
         candidates = [
             {"ClassName": "mmui::XValidatorTextEdit", "Name": "搜索"},
@@ -139,21 +210,20 @@ class WeChatNT:
 
     def ChatWith(self, who):
         """切换到指定群/联系人聊天窗口，优先会话列表直接点击，回退到搜索框"""
-        # 确保微信窗口在前台，防止 UIA 操作在后台失效
         try:
             win32gui.SetForegroundWindow(self.HWND)
-            time.sleep(0.05)
         except Exception:
             pass
 
         # 路径1：从 session_list 直接按 AutomationId 点击（新版Qt微信）
         try:
             session = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
-            if session.Exists(0.08):
-                session.Click()
-                self._current_chat = who
-                self._wait_input_ready()
-                return True
+            if session.Exists(0):
+                rect = session.BoundingRectangle
+                if rect.width > 0 and rect.height > 0:
+                    session.Select(waitTime=0)
+                    self._current_chat = who
+                    return True
         except Exception:
             pass
 
@@ -163,63 +233,54 @@ class WeChatNT:
             for item in items:
                 try:
                     if who in item.Name:
-                        item.Click()
-                        self._current_chat = who
-                        self._wait_input_ready()
-                        return True
+                        rect = item.BoundingRectangle
+                        if rect.width > 0 and rect.height > 0:
+                            item.Select(waitTime=0)
+                            self._current_chat = who
+                            return True
                 except Exception:
                     continue
         except Exception:
             pass
 
         # 路径3：使用搜索框（多候选查找搜索框）
-        search_box = self._find_search_box(timeout=0.25)
+        search_box = self._find_search_box(timeout=0.05)
         if search_box:
             try:
-                search_box.Click()
-                time.sleep(0.03)
-                search_box.SendKeys('{Ctrl}a{Delete}')
+                search_box.Click(simulateMove=False, waitTime=0)
+                search_box.SendKeys('{Ctrl}a{Delete}', waitTime=0)
                 set_clipboard_text(who)
-                search_box.SendKeys('{Ctrl}v')
-                # 动态轮询等待搜索结果出现，最长等 500ms（替换原来固定 300ms sleep）
-                deadline = time.time() + 0.5
-                while time.time() < deadline:
-                    result = self.session_list.ListItemControl()
-                    if result.Exists(0.05):
-                        break
-                    time.sleep(0.03)
-                search_box.SendKeys('{Enter}')
+                search_box.SendKeys('{Ctrl}v', waitTime=0)
+                time.sleep(0.05) # 50ms 等待搜索结果渲染
+                search_box.SendKeys('{Enter}', waitTime=0)
                 self._current_chat = who
-                self._wait_input_ready()
                 return True
             except Exception:
                 pass
 
         return False
 
-    def _wait_input_ready(self, timeout=0.3):
-        """等待聊天输入框出现，多候选，最长等 timeout 秒"""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            f = self._find_input_field(timeout=0.05)
-            if f:
-                return f
-            time.sleep(0.02)
-        return None
-
     def SendMsg(self, msg):
         """发送消息到当前已激活的聊天窗口"""
-        # 确保微信在前台
         try:
             win32gui.SetForegroundWindow(self.HWND)
         except Exception:
             pass
 
-        input_field = self._find_input_field(timeout=0.15)
-        if not input_field:
+        if not hasattr(self, 'input_field') or not self.input_field:
+            self.input_field = self._find_input_field(timeout=0.05)
+            
+        if not self.input_field:
             raise Exception("未找到聊天输入框，请确认群聊窗口已正确打开")
 
-        input_field.SetFocus()
+        try:
+            self.input_field.SetFocus()
+        except Exception:
+            self.input_field = self._find_input_field(timeout=0.05)
+            if not self.input_field:
+                raise Exception("未找到聊天输入框，请确认群聊窗口已正确打开")
+            self.input_field.SetFocus()
+
         set_clipboard_text(msg)
 
         # 原生 Win32 keybd_event 零延迟模拟键盘，消除 uiautomation SendKeys 内置的 120ms+ 延时
@@ -236,7 +297,7 @@ class WeChatNT:
         win32api.keybd_event(ord('V'), 0, win32con.KEYEVENTF_KEYUP, 0)
         win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
 
-        paste_delay = max(0.005, min(0.05, len(msg) * 0.0001))
+        paste_delay = max(0.002, min(0.03, len(msg) * 0.0001))
         time.sleep(paste_delay)
 
         win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
@@ -244,13 +305,12 @@ class WeChatNT:
 
     def GetCurrentActiveChatName(self):
         """读取当前打开的聊天窗口名称（多候选标题栏查找）"""
-        # 尝试缓存的标题栏
         if not self.chat_title_bar:
             self.chat_title_bar = self._find_control_multi(
                 [("group", {"ClassName": "mmui::ChatTitleBarMasterView"}),
                  ("group", {"ClassName": "TitleBarView"}),
                  ("group", {"AutomationId": "chat_title_bar"})],
-                timeout=0.1
+                timeout=0
             )
         if not self.chat_title_bar:
             return None
@@ -259,7 +319,7 @@ class WeChatNT:
         for kwargs in [{"ClassName": "mmui::XTextView"}, {"ClassName": "XTextView"}, {}]:
             try:
                 label = self.chat_title_bar.TextControl(**kwargs)
-                if label.Exists(0.05):
+                if label.Exists(0):
                     return label.Name
             except Exception:
                 continue
@@ -267,16 +327,14 @@ class WeChatNT:
 
     def GetLastMessage(self, who):
         """从会话列表读取指定群的最后一条消息（发送者, 内容）"""
-        # 路径1：AutomationId 精确查找（新版Qt微信）
         session = None
         try:
             s = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
-            if s.Exists(0.05):
+            if s.Exists(0):
                 session = s
         except Exception:
             pass
 
-        # 路径2：Name 模糊匹配（旧版微信）
         if not session:
             try:
                 items = self.session_list.GetChildren()
@@ -305,6 +363,11 @@ class WeChatNT:
         msg_line = lines[-2]
         if ':' in msg_line:
             parts = msg_line.split(':', 1)
+            sender = parts[0].strip()
+            content = parts[1].strip() if len(parts) > 1 else ""
+            return sender, content
+        elif '：' in msg_line:
+            parts = msg_line.split('：', 1)
             sender = parts[0].strip()
             content = parts[1].strip() if len(parts) > 1 else ""
             return sender, content
@@ -470,7 +533,7 @@ class WeChatBotWxAutoGUI:
         
         # 1. 便签草稿箱
         ttk.Label(middle_frame, text="便签草稿箱 (临时文本编辑与交换):").grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
-        self.txt_scratchpad = scrolledtext.ScrolledText(middle_frame, height=6, font=("微软雅黑", 9))
+        self.txt_scratchpad = scrolledtext.ScrolledText(middle_frame, height=6, font=("微软雅黑", 9), wrap="none")
         self.txt_scratchpad.grid(row=1, column=0, columnspan=2, sticky="we", pady=2)
         
         # 草稿箱操作按钮
@@ -661,7 +724,7 @@ class WeChatBotWxAutoGUI:
         with self.rules_lock:
             new_target_rooms = list(set(r['room'] for r in self.rules))
         
-        # 找出新增加的群聊和已被移除 of the monitored list
+        # 找出新增加的群聊和已被移除的群聊
         added_rooms = [r for r in new_target_rooms if r not in self.target_rooms]
         removed_rooms = [r for r in self.target_rooms if r not in new_target_rooms]
         
@@ -669,17 +732,9 @@ class WeChatBotWxAutoGUI:
             self.log(f"检测到新群聊【{r}】，正在将其加入监控列表并初始化...")
             sender_init, content_init = self.wx.GetLastMessage(r)
             if sender_init is None and content_init is None:
-                try:
-                    self.wx.ChatWith(r)
-                    time.sleep(0.2)
-                    sender_init, content_init = self.wx.GetLastMessage(r)
-                except Exception as e:
-                    self.log(f"警告：初始化新群聊【{r}】失败，请确保该群在微信聊天列表中或名称完全正确！错误: {e}")
-            
-            if sender_init and content_init:
-                self.last_msg_sigs[r] = f"{sender_init}:{content_init}"
+                self.last_msg_sigs[r] = "OFFLINE_PLACEHOLDER"
             else:
-                self.last_msg_sigs[r] = ""
+                self.last_msg_sigs[r] = f"{sender_init or ''}:{content_init or ''}"
             self.log(f"新群聊【{r}】初始化完成。")
             
         for r in removed_rooms:
@@ -772,6 +827,14 @@ class WeChatBotWxAutoGUI:
                 time.sleep(0.5)
                 continue
                 
+            # 自动维护与微信的连接稳定性，断线后自动重连
+            try:
+                self.wx.check_connection()
+            except Exception as e:
+                self.gui_queue.put(("", "系统提示", f"微信连接已断开，正在尝试重连... 错误: {e}", 'friend'))
+                time.sleep(2)
+                continue
+                
             current_target_rooms = list(self.target_rooms)
             for room in current_target_rooms:
                 if not self.is_monitoring:
@@ -780,10 +843,29 @@ class WeChatBotWxAutoGUI:
                 try:
                     # 获取该群最后一条消息的发送者和内容
                     sender, content = self.wx.GetLastMessage(room)
-                    if sender and content:
+                    if sender is not None or content is not None:
+                        sender = sender or ""
+                        content = content or ""
                         msg_sig = f"{sender}:{content}"
+                        
+                        # 过滤自己发送的消息、发送中、草稿等中间状态，防止自循环或双重回复
+                        is_valid_msg = (
+                            sender != "" and 
+                            sender not in ["我", "me", "Me"] and 
+                            not sender.startswith("[草稿]") and 
+                            "正在发送" not in content and 
+                            "发送中" not in content
+                        )
+                        
+                        if not is_valid_msg:
+                            self.last_msg_sigs[room] = msg_sig
+                            continue
+                            
+                        # 获取旧的消息签名
                         old_sig = self.last_msg_sigs.get(room, "")
-                        if msg_sig != old_sig:
+                        
+                        # 如果是离线状态恢复（收到第一条消息跳至顶部），或者签名与上次不一致，才触发秒回
+                        if old_sig == "OFFLINE_PLACEHOLDER" or msg_sig != old_sig:
                             self.last_msg_sigs[room] = msg_sig
                             # 推送到主线程队列（仅供展示使用）
                             self.gui_queue.put((room, sender, content, 'friend'))
@@ -809,10 +891,9 @@ class WeChatBotWxAutoGUI:
                                                 
                                         if content_matched:
                                             # 将回复任务投入串行发送队列，由 sender_worker 串行处理
-                                            # 避免多线程并发抢夺剪贴板和键盘焦点导致消息乱序或延迟
                                             self.reply_queue.put((room, content, rule['reply']))
                 except Exception as e:
-                    pass
+                    print(f"[监控异常] 处理群聊【{room}】时发生错误: {e}")
                 
             time.sleep(0.01) # 扫描完所有群后等待 10ms
 
@@ -915,30 +996,20 @@ class WeChatBotWxAutoGUI:
             self.last_msg_sigs = {}
             self.current_active_room = None
             
-            first_room = self.target_rooms[0]
-            try:
-                self.log(f"正在初始化窗口，激活首个群聊【{first_room}】...")
-                self.wx.ChatWith(first_room)
-                self.current_active_room = first_room
-                
-                # 初始化所有目标群的消息签名
-                for r in self.target_rooms:
-                    sender_init, content_init = self.wx.GetLastMessage(r)
-                    if sender_init and content_init:
-                        self.last_msg_sigs[r] = f"{sender_init}:{content_init}"
+            # 初始化所有目标群聊的消息签名（如不可见则标志为离线，待其发新消息跳转到顶端时秒回）
+            for room in self.target_rooms:
+                try:
+                    sender_init, content_init = self.wx.GetLastMessage(room)
+                    if sender_init is not None or content_init is not None:
+                        self.last_msg_sigs[room] = f"{sender_init or ''}:{content_init or ''}"
                     else:
-                        self.last_msg_sigs[r] = ""
-                        
-                self.log(f"已锁定并激活所有群聊，共 {len(self.target_rooms)} 个。开始监控消息...")
-            except Exception as e:
-                self.log(f"激活群聊失败: {e}")
-                messagebox.showerror("打开错误", f"无法切换到该群聊！\n请确保微信中该群聊在聊天列表中可见，或者名称完全正确。\n\n错误: {e}")
-                return
-                
+                        self.last_msg_sigs[room] = "OFFLINE_PLACEHOLDER"
+                except Exception:
+                    self.last_msg_sigs[room] = "OFFLINE_PLACEHOLDER"
+            
+            self.log(f"已锁定监控群聊列表，共 {len(self.target_rooms)} 个。开始监控消息...")
             self.is_monitoring = True
             self.btn_action.config(text=" 停止秒回监控 ", style="Danger.TButton")
-            
-            # 不再禁用编辑器控件与表单，允许用户随时修改规则
             
             with self.rules_lock:
                 rules_count = len(self.rules)
@@ -946,7 +1017,6 @@ class WeChatBotWxAutoGUI:
         else:
             self.is_monitoring = False
             self.btn_action.config(text=" 第二步：启动秒回监控 ", style="Success.TButton")
-            
             self.log("⏸ 秒回监控已暂停。")
 
     def load_snippets(self):
