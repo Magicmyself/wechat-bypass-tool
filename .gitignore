@@ -47,3 +47,7 @@ ENV/
 # Local databases (Notepad / Rules)
 wechat_rules.json
 wechat_snippets.json
+
+# UIA Automation Logs
+@AutomationLog.txt
+
