@@ -238,6 +238,11 @@ class WeChatNT:
         except Exception:
             pass
 
+        # 预先定义规范化比对函数，用于等待界面标题变更
+        def clean_str(s):
+            return re.sub(r'[\s\(\)（）\d]+', '', s).lower()
+        who_normalized = clean_str(who)
+
         # 路径1：从 session_list 直接按 AutomationId 点击（新版Qt微信）
         try:
             session = self.session_list.ListItemControl(AutomationId=f'session_item_{who}')
@@ -245,6 +250,15 @@ class WeChatNT:
                 rect = session.BoundingRectangle
                 if rect.width > 0 and rect.height > 0:
                     session.Click(simulateMove=False, waitTime=0)
+                    
+                    # 轮询标题栏直到与目标匹配，防止微信切换渲染延迟导致消息发送到前一个窗口
+                    start_wait = time.time()
+                    while time.time() - start_wait < 0.3:
+                        curr = self.GetCurrentActiveChatName() or ""
+                        if who_normalized in clean_str(curr):
+                            break
+                        time.sleep(0.005)
+                        
                     self._current_chat = who
                     return True
         except Exception:
@@ -261,6 +275,15 @@ class WeChatNT:
                         rect = item.BoundingRectangle
                         if rect.width > 0 and rect.height > 0:
                             item.Click(simulateMove=False, waitTime=0)
+                            
+                            # 轮询标题栏直到与目标匹配
+                            start_wait = time.time()
+                            while time.time() - start_wait < 0.3:
+                                curr = self.GetCurrentActiveChatName() or ""
+                                if who_normalized in clean_str(curr):
+                                    break
+                                time.sleep(0.005)
+                                
                             self._current_chat = who
                             return True
                 except Exception:
@@ -278,6 +301,15 @@ class WeChatNT:
                 search_box.SendKeys('{Ctrl}v', waitTime=0)
                 time.sleep(0.05) # 50ms 等待搜索结果渲染
                 search_box.SendKeys('{Enter}', waitTime=0)
+                
+                # 轮询标题栏直到与目标匹配
+                start_wait = time.time()
+                while time.time() - start_wait < 0.3:
+                    curr = self.GetCurrentActiveChatName() or ""
+                    if who_normalized in clean_str(curr):
+                        break
+                    time.sleep(0.005)
+                    
                 self._current_chat = who
                 return True
             except Exception:
